@@ -89,6 +89,8 @@ class RunConfig(BaseModel):
     user_model: str = "gpt-4o"
     intervention_model: Optional[str] = "gpt-4o"
     intervention_model_provider: Optional[str] = None
+    search_model: Optional[str] = None
+    search_model_provider: Optional[str] = None
     num_trials: int = 1
     env: str = "retail"
     agent_strategy: str = "tool-calling"

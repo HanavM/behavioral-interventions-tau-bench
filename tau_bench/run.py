@@ -15,6 +15,23 @@ from tau_bench.types import EnvRunResult, RunConfig
 from litellm import provider_list
 from tau_bench.envs.user import UserStrategy
 
+# attempts within one task are independent; >1 runs them in parallel
+ATTEMPT_CONCURRENCY = int(os.getenv("TAU_ATTEMPT_CONCURRENCY", "1"))
+
+
+
+
+def _atomic_write_json(path, payload):
+    """Write JSON via a temp file + atomic rename.
+
+    Checkpoints are rewritten in full on every attempt and grow to tens of MB,
+    so truncating the real file first means any interruption destroys the whole
+    run history. os.replace is atomic on POSIX.
+    """
+    tmp = f"{path}.tmp{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(payload, f, indent=2)
+    os.replace(tmp, path)
 
 def find_existing_baseline_folder(config: RunConfig, seed: int) -> Optional[str]:
     """Find a previously-created baseline run folder for this exact config
@@ -135,8 +152,7 @@ def run_baseline(config: RunConfig, existing_folder: Optional[str] = None) -> Li
                 if os.path.exists(ckpt_path):
                     with open(ckpt_path, "r") as f:
                         data = json.load(f)
-                with open(ckpt_path, "w") as f:
-                    json.dump(data + [result.model_dump()], f, indent=2)
+                _atomic_write_json(ckpt_path, data + [result.model_dump()])
 
             # results_intervened.extend
 
@@ -152,9 +168,8 @@ def run_baseline(config: RunConfig, existing_folder: Optional[str] = None) -> Li
 
     display_metrics(results)
 
-    with open(ckpt_path, "w") as f:
-        json.dump([result.model_dump() for result in results], f, indent=2)
-        print(f"\n📄 Results saved to {ckpt_path}\n")
+    _atomic_write_json(ckpt_path, [result.model_dump() for result in results])
+    print(f"\n📄 Results saved to {ckpt_path}\n")
 
     return results
 
@@ -305,8 +320,7 @@ def run(config: RunConfig) -> List[EnvRunResult]:
                         if os.path.exists(ckpt_path_intervened):
                             with open(ckpt_path_intervened, "r") as f:
                                 data = json.load(f)
-                        with open(ckpt_path_intervened, "w") as f:
-                            json.dump(data + [result_intervened.model_dump()], f, indent=2)
+                        _atomic_write_json(ckpt_path_intervened, data + [result_intervened.model_dump()])
                         # continue
                 else:
 
@@ -345,8 +359,7 @@ def run(config: RunConfig) -> List[EnvRunResult]:
                                 if os.path.exists(ckpt_path_intervened):
                                     with open(ckpt_path_intervened, "r") as f:
                                         data = json.load(f)
-                                with open(ckpt_path_intervened, "w") as f:
-                                    json.dump(data + [result_intervened.model_dump()], f, indent=2)
+                                _atomic_write_json(ckpt_path_intervened, data + [result_intervened.model_dump()])
                         # if (answer_list[0] != False):
                         total.append(True)
                         if (does_improve == True):
@@ -432,69 +445,64 @@ def run(config: RunConfig) -> List[EnvRunResult]:
 
                         #loop through all intervention possibilites
                         # for best_of_n_iterator, intervention in enumerate([sorted_answer_list[0], sorted_answer_list[-1]]):
-                        for best_of_n_iterator, intervention in enumerate(sorted_answer_list):
+                        def _attempt(item):
+                            """Run one intervention attempt. Attempts are independent, so they run
+                            in parallel; each needs its own env because Env carries rollout state."""
+                            best_of_n_iterator, intervention = item
                             print(f"trying out task id={idx}, intervention {best_of_n_iterator}")
-                            
                             failure_brief = intervention["failure_brief"]
                             failure_id = intervention["failure_id"]
                             intervention_text = intervention["intervention_text"]
                             intervention_id = intervention["id"]
-                            print(f"intervention id: {intervention_id} intervention txt: {intervention_text}")
-                            
-                            #add intervention to trajectory
                             new_intervened_trajectory = add_intervention(transcript["traj"], intervention_text, intervention_id)
-
-                            possible_new_trajectories.append(new_intervened_trajectory)
-
-                            
-                            #Run again but with intervention
-                            res_intervened = agent.solve_with_intervention(
-                                env=isolated_env,
+                            attempt_env = get_env(
+                                config.env,
+                                user_strategy=config.user_strategy,
+                                user_model=config.user_model,
+                                task_split=config.task_split,
+                                user_provider=config.user_model_provider,
                                 task_index=idx,
-                                messages=new_intervened_trajectory
                             )
-                            
-
-                            # print("ran new agent task with intervened transcript")
-
-
-                            first_or_last = str(best_of_n_iterator)
-                            # if (best_of_n_iterator == 1):
-                            #     first_or_last = "last"
-                            
-                            #compile result of intervention
+                            res_intervened = agent.solve_with_intervention(
+                                env=attempt_env, task_index=idx, messages=new_intervened_trajectory
+                            )
                             result_intervened = EnvRunResult(
-                                failure_brief = failure_brief,
-                                failure_index = str(failure_id),
-                                intervened_message = intervention_text,
-                                intervened_first_or_last = first_or_last,
-                                intervened_index = str(intervention_id),
-                                improved = (result.reward == 0 and res_intervened.reward != 0),
-                                success_prev = result.reward,
-                                success_after = res_intervened.reward,
+                                failure_brief=failure_brief,
+                                failure_index=str(failure_id),
+                                intervened_message=intervention_text,
+                                intervened_first_or_last=str(best_of_n_iterator),
+                                intervened_index=str(intervention_id),
+                                improved=(result.reward == 0 and res_intervened.reward != 0),
+                                success_prev=result.reward,
+                                success_after=res_intervened.reward,
                                 task_id=idx,
                                 reward=res_intervened.reward,
                                 info=res_intervened.info,
                                 traj=res_intervened.messages,
                                 trial=i,
                             )
-                            
                             if result.reward == 0 and result_intervened.reward != 0:
                                 print(f"***IMPROVED*** task_id={idx} at location={intervention_id}")
-                                does_improve = True
-                            
-                            if result_intervened.reward != 0:
-                                passed_intervened = True
-                                best_intervened_score = max(result_intervened.reward, best_intervened_score)
-
-                        #save result of intervention
                             with lock:
                                 data = []
                                 if os.path.exists(ckpt_path_intervened):
                                     with open(ckpt_path_intervened, "r") as f:
                                         data = json.load(f)
-                                with open(ckpt_path_intervened, "w") as f:
-                                    json.dump(data + [result_intervened.model_dump()], f, indent=2)
+                                _atomic_write_json(ckpt_path_intervened, data + [result_intervened.model_dump()])
+                            return result_intervened
+
+                        attempt_workers = max(1, min(ATTEMPT_CONCURRENCY, len(sorted_answer_list)))
+                        with ThreadPoolExecutor(max_workers=attempt_workers) as attempt_pool:
+                            attempt_results = list(attempt_pool.map(_attempt, list(enumerate(sorted_answer_list))))
+                        for r_att in attempt_results:
+                            if result.reward == 0 and r_att.reward != 0:
+                                does_improve = True
+                            if r_att.reward != 0:
+                                passed_intervened = True
+                                best_intervened_score = max(r_att.reward, best_intervened_score)
+                        if attempt_results:
+                            result_intervened = max(attempt_results, key=lambda r: r.reward)
+
                         # if (answer_list[0] != False):
                         total.append(True)
                         if (does_improve == True):
@@ -516,8 +524,7 @@ def run(config: RunConfig) -> List[EnvRunResult]:
                     if os.path.exists(ckpt_path_intervened):
                         with open(ckpt_path_intervened, "r") as f:
                             data = json.load(f)
-                    with open(ckpt_path_intervened, "w") as f:
-                        json.dump(data + [result_intervened.model_dump()], f, indent=2)
+                    _atomic_write_json(ckpt_path_intervened, data + [result_intervened.model_dump()])
 
             
             try:
@@ -617,6 +624,9 @@ def agent_factory(
             intervenor_temperature=config.intervenor_temperature,
             intervention_model=config.intervention_model,
             intervention_provider=config.intervention_model_provider or "openai",
+            search_model=config.search_model or config.intervention_model,
+            search_provider=config.search_model_provider
+            or (config.intervention_model_provider or "openai"),
         )
     
     elif config.agent_strategy == "react-reflexion":

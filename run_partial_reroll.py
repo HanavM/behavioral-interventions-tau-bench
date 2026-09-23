@@ -53,6 +53,17 @@ def parse_args():
         help="The model provider for the failure-point identification model (defaults to openai)",
     )
     parser.add_argument(
+        "--search_model",
+        type=str,
+        help="Model backing the intervenor's transcript-search tool (defaults to the intervenor model)",
+    )
+    parser.add_argument(
+        "--search-model-provider",
+        type=str,
+        choices=provider_list,
+        help="Provider for the search-tool model (defaults to the intervenor's provider)",
+    )
+    parser.add_argument(
         "--user-model",
         type=str,
         default="gpt-4o",
@@ -113,6 +124,8 @@ def parse_args():
         user_model=args.user_model,
         intervention_model=args.intervention_model,
         intervention_model_provider=args.intervention_model_provider,
+        search_model=args.search_model,
+        search_model_provider=args.search_model_provider,
         env=args.env,
         agent_strategy=args.agent_strategy,
         temperature=args.temperature,

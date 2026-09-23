@@ -11,7 +11,9 @@ from openai import OpenAI
 import openai
 import os 
 api_key = os.getenv('OPENAI_API_KEY')
-client = OpenAI(api_key=api_key)
+# every LLM call in this module goes through litellm; this client is kept only for
+# backwards compatibility and must not make importing the module require an OpenAI key
+client = OpenAI(api_key=api_key) if api_key else None
 
 
 #docent
@@ -82,6 +84,8 @@ class ChatReActAgentIntervened(Agent):
         intervenor_temperature: float = 0.2,
         intervention_model: str = "gpt-4o-mini-2024-07-18",
         intervention_provider: str = "openai",
+        search_model: Optional[str] = None,
+        search_provider: Optional[str] = None,
     ) -> None:
         instruction = REACT_INSTRUCTION if use_reasoning else ACT_INSTRUCTION
         self.prompt = (
@@ -93,6 +97,10 @@ class ChatReActAgentIntervened(Agent):
         self.intervenor_temperature = intervenor_temperature
         self.intervention_model = intervention_model
         self.intervention_provider = intervention_provider
+        # model backing the docent_query_tool (transcript search); held separate
+        # from the intervenor so tool quality does not confound intervenor quality
+        self.search_model = search_model or intervention_model
+        self.search_provider = search_provider or intervention_provider
         self.use_reasoning = use_reasoning
         self.tools_info = tools_info
 
@@ -119,6 +127,50 @@ class ChatReActAgentIntervened(Agent):
         while msgs and msgs[-1].get("role") == "assistant":
             msgs.pop()
         return msgs
+
+
+    @staticmethod
+    def _portable_history(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Rewrite the intervenor conversation without OpenAI-specific tool plumbing.
+
+        Non-OpenAI endpoints (Llama/Mistral/DeepSeek/Kimi on Azure AI) reject an
+        assistant message carrying `tool_calls` plus a `role: "tool"` reply when no
+        tool schema was declared. The search result is folded into a plain user
+        message instead, which preserves what the intervenor sees.
+        """
+        out: List[Dict[str, Any]] = []
+        for m in messages:
+            m = dict(m)
+            if m.get("role") == "tool":
+                out.append({"role": "user", "content": "[SEARCH TOOL RESULT]\n" + (m.get("content") or "")})
+                continue
+            m.pop("tool_calls", None)
+            m.pop("tool_call_id", None)
+            if not m.get("content"):
+                m["content"] = "(empty)"
+            out.append(m)
+        return out
+
+    def _intervenor_completion(self, conversation_history: List[Dict[str, Any]]):
+        """Intervenor call with a provider-portable retry."""
+        try:
+            return completion_with_backoff(
+                model=self.intervention_model,
+                custom_llm_provider=self.intervention_provider,
+                num_retries=5,
+                messages=conversation_history,
+                max_completion_tokens=4096,
+                temperature=self.intervenor_temperature,
+            )
+        except BadRequestError:
+            return completion_with_backoff(
+                model=self.intervention_model,
+                custom_llm_provider=self.intervention_provider,
+                num_retries=5,
+                messages=self._portable_history(conversation_history),
+                max_tokens=4096,
+                temperature=self.intervenor_temperature,
+            )
 
     def generate_next_step(
         self, messages: List[Dict[str, Any]]
@@ -284,9 +336,9 @@ class ChatReActAgentIntervened(Agent):
 
         def execute_search(text, query, model):
 
-            response = completion(
-                model=self.intervention_model,
-                custom_llm_provider=self.intervention_provider,
+            response = completion_with_backoff(
+                model=self.search_model,
+                custom_llm_provider=self.search_provider,
                 num_retries=5,
                 messages=[{"role": "user","content":SEARCH_PROMPT.format(text=text, search_query=query, SINGLE_RUN_CITE_INSTRUCTION=SINGLE_RUN_CITE_INSTRUCTION)}],
                 max_completion_tokens=4096,
@@ -336,22 +388,23 @@ class ChatReActAgentIntervened(Agent):
             "content": questioning_agent_prompt_working_backwards.format(specification=specification, ref_metadata=user_task, N=N, transcript_length = transcript_length),
         })   
         
+        if self.intervention_provider not in ("openai", "azure"):
+            # open-weight endpoints continue a system-only prompt instead of acting
+            # on it; an explicit user turn is required to start the intervenor loop
+            conversation_history.append({"role": "user", "content": "Begin."})
+
         turns = 0
 
         while turns < 30:
             try:
                 turns+=1
                 # print("turn:", turns)
-                response = completion(
-                    model=self.intervention_model,
-                    custom_llm_provider=self.intervention_provider,
-                    num_retries=5,
-                    messages=conversation_history,
-                    max_completion_tokens=4096,
-                    temperature=self.intervenor_temperature
-                )
+                response = self._intervenor_completion(conversation_history)
 
                 reply = (response.choices[0].message.content or "").strip()
+                if not reply:
+                    # reasoning models return the tagged output on reasoning_content
+                    reply = (getattr(response.choices[0].message, "reasoning_content", None) or "").strip()
                 match = re.search(r'<query>(.*?)</query>', reply, re.DOTALL)
 
                 conversation_history.append({
@@ -476,9 +529,9 @@ class ChatReActAgentIntervened(Agent):
 
         def execute_search(text, query, model):
 
-            response = completion(
-                model=self.intervention_model,
-                custom_llm_provider=self.intervention_provider,
+            response = completion_with_backoff(
+                model=self.search_model,
+                custom_llm_provider=self.search_provider,
                 num_retries=5,
                 messages=[{"role": "user","content":SEARCH_PROMPT.format(text=text, search_query=query, SINGLE_RUN_CITE_INSTRUCTION=SINGLE_RUN_CITE_INSTRUCTION)}],
                 max_completion_tokens=4096,
@@ -521,22 +574,21 @@ class ChatReActAgentIntervened(Agent):
             "content": questioning_agent_prompt_working_backwards_react.format(specification=specification, ref_metadata=user_task,reward_info=metadata, N=N),
         })   
         
+        if self.intervention_provider not in ("openai", "azure"):
+            conversation_history.append({"role": "user", "content": "Begin."})
+
         turns = 0
         while turns < 30:
             # break
             turns += 1
             print("turn:", turns)
-            response = completion(
-                model=self.intervention_model,
-                custom_llm_provider=self.intervention_provider,
-                num_retries=5,
-                messages=conversation_history,
-                max_completion_tokens=4096,
-                temperature=self.intervenor_temperature
-            )
+            response = self._intervenor_completion(conversation_history)
 
             
             reply = (response.choices[0].message.content or "").strip()
+            if not reply:
+                # reasoning models return the tagged output on reasoning_content
+                reply = (getattr(response.choices[0].message, "reasoning_content", None) or "").strip()
 
             # print(reply)
 

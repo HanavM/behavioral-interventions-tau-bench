@@ -30,6 +30,17 @@ def parse_args() -> RunConfig:
         help="The model provider for the intervenor agent (defaults to openai)",
     )
     parser.add_argument(
+        "--search_model",
+        type=str,
+        help="Model backing the intervenor's transcript-search tool (defaults to the intervenor model)",
+    )
+    parser.add_argument(
+        "--search-model-provider",
+        type=str,
+        choices=provider_list,
+        help="Provider for the search-tool model (defaults to the intervenor's provider)",
+    )
+    parser.add_argument(
         "--baseline_path",
         type=str,
         help="Path of the baseline results",
@@ -124,6 +135,8 @@ def parse_args() -> RunConfig:
         baseline_path=args.baseline_path,
         intervention_model=args.intervention_model,
         intervention_model_provider=args.intervention_model_provider,
+        search_model=args.search_model,
+        search_model_provider=args.search_model_provider,
 
     )
 

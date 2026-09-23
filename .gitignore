@@ -8,3 +8,7 @@ __pycache__/
 .history/
 .history/
 .azure_foundry.env
+
+# macOS + local run noise
+.DS_Store
+.server_logs/

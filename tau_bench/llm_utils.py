@@ -28,11 +28,14 @@ def completion_with_backoff(**kwargs):
     short retry backoff can exhaust its attempts inside a single window.
     """
     kwargs.setdefault("timeout", 300)
-    max_attempts = 8
+    max_attempts = 14
     for attempt in range(max_attempts):
         try:
             return completion(**kwargs)
         except TRANSIENT_ERRORS:
             if attempt == max_attempts - 1:
                 raise
-            time.sleep(min(75, 10 * (attempt + 1)))
+            # ramp to 2 min between tries: sustained rate limiting under high
+            # concurrency can last many minutes, and giving up mid-loop silently
+            # discards a whole task's intervention
+            time.sleep(min(120, 10 * (attempt + 1)))
